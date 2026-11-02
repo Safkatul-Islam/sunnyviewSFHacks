@@ -23,7 +23,7 @@ const RATE_LIMIT_MAX = 8
 
 export async function POST(request: Request) {
   const clientKey = requestClientKey(request.headers)
-  const rate = takeRateLimitToken({
+  const rate = await takeRateLimitToken({
     key: `tts:${clientKey}`,
     limit: RATE_LIMIT_MAX,
     windowMs: RATE_LIMIT_WINDOW_MS,
