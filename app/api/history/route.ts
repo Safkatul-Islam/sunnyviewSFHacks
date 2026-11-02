@@ -88,7 +88,7 @@ function withVisitorCookie(payload: unknown, visitor: ReturnType<typeof getOrCre
 
 export async function GET(req: NextRequest) {
   const clientKey = requestClientKey(req.headers)
-  const rate = takeRateLimitToken({
+  const rate = await takeRateLimitToken({
     key: `history:list:${clientKey}`,
     limit: LIST_RATE_LIMIT_MAX,
     windowMs: RATE_LIMIT_WINDOW_MS,
@@ -125,7 +125,7 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   const clientKey = requestClientKey(req.headers)
-  const rate = takeRateLimitToken({
+  const rate = await takeRateLimitToken({
     key: `history:save:${clientKey}`,
     limit: SAVE_RATE_LIMIT_MAX,
     windowMs: RATE_LIMIT_WINDOW_MS,
