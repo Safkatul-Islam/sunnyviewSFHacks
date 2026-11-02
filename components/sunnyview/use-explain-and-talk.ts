@@ -44,6 +44,8 @@ export type ExplainAndTalk = {
   ttsLoading: boolean;
   /** null until read from localStorage after the app opens. */
   hasLocalElevenLabsKey: boolean | null;
+  /** True once the backend answered Talk without audio (no usable ElevenLabs key); false after audio plays. */
+  ttsNeedsKey: boolean;
   runExplain: () => Promise<void>;
   runTalk: () => Promise<void>;
 };
@@ -64,6 +66,7 @@ export function useExplainAndTalk(input: ExplainAndTalkInput): ExplainAndTalk {
   }, [hasSite]);
   const [ttsLoading, setTtsLoading] = useState(false);
   const [hasLocalElevenLabsKey, setHasLocalElevenLabsKey] = useState<boolean | null>(null);
+  const [ttsNeedsKey, setTtsNeedsKey] = useState(false);
 
   useEffect(() => {
     if (!opened) {
@@ -141,6 +144,7 @@ export function useExplainAndTalk(input: ExplainAndTalkInput): ExplainAndTalk {
       }
       const rec = asRecord(data);
       const audioUrl = typeof rec?.audioUrl === "string" ? rec.audioUrl : null;
+      setTtsNeedsKey(!audioUrl);
       if (!audioUrl) {
         setActionNotice(typeof rec?.note === "string" ? rec.note : TTS_UNAVAILABLE_MESSAGE);
         return;
@@ -154,5 +158,5 @@ export function useExplainAndTalk(input: ExplainAndTalkInput): ExplainAndTalk {
     }
   }
 
-  return { explainLoading, explainText, ttsLoading, hasLocalElevenLabsKey, runExplain, runTalk };
+  return { explainLoading, explainText, ttsLoading, hasLocalElevenLabsKey, ttsNeedsKey, runExplain, runTalk };
 }
