@@ -197,6 +197,22 @@ describe("useExplainAndTalk runTalk", () => {
     expect(result.current.ttsLoading).toBe(false);
   });
 
+  it("flags a missing key only after the backend returns no audio, and clears it once audio plays", async () => {
+    fetchMock
+      .mockImplementationOnce(async () => Response.json({ audioUrl: null, note: "No voice configured" }))
+      .mockImplementationOnce(async () => Response.json({ audioUrl: "u" }));
+    const { result } = renderHook(() => useExplainAndTalk(makeInput()));
+    expect(result.current.ttsNeedsKey).toBe(false);
+    await act(async () => {
+      await result.current.runTalk();
+    });
+    expect(result.current.ttsNeedsKey).toBe(true);
+    await act(async () => {
+      await result.current.runTalk();
+    });
+    expect(result.current.ttsNeedsKey).toBe(false);
+  });
+
   it("uses the default unavailable message for null audio without a note", async () => {
     fetchMock.mockImplementation(async () => Response.json({}));
     const input = makeInput();
