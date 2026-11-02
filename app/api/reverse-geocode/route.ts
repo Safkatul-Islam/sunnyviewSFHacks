@@ -61,7 +61,7 @@ async function nominatimReverseLabel(lat: number, lng: number, signal: AbortSign
 
 export async function GET(req: NextRequest) {
   const clientKey = requestClientKey(req.headers)
-  const rate = takeRateLimitToken({
+  const rate = await takeRateLimitToken({
     key: `reverse-geocode:${clientKey}`,
     limit: RATE_LIMIT_MAX,
     windowMs: RATE_LIMIT_WINDOW_MS,

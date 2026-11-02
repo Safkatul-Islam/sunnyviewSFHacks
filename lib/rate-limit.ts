@@ -1,10 +1,13 @@
-// NOTE: This limiter is per-instance and in-memory (state lives on globalThis).
-// On multi-instance / serverless deployments each instance keeps its own buckets,
-// so limits are best-effort. Distributed (Upstash) limiting is out of scope.
+// With Upstash Redis configured (see lib/redis.ts), buckets are shared fixed-window
+// counters in Redis, so limits hold across serverless instances. Without Redis, or
+// when it errors or is slow, each instance falls back to its own in-memory buckets
+// (state on globalThis), which makes limits best-effort on multi-instance deployments.
 //
 // Client identity (see requestClientKey) is only as trustworthy as the proxy in
 // front of the app: forwarding headers are client-controlled unless a trusted
 // proxy overwrites them. We therefore honour one explicitly configured header.
+
+import { getRedis } from "@/lib/redis"
 
 type RateBucket = {
   count: number
@@ -16,11 +19,28 @@ type RateLimitResult = {
   retryAfterSec: number
 }
 
+type RateLimitOptions = { key: string; limit: number; windowMs: number }
+
 const MAX_BUCKETS = 4000
 const SWEEP_INTERVAL_MS = 30_000
 const MAX_KEY_LENGTH = 64
+const REDIS_KEY_PREFIX = "sv:rl:"
+const REDIS_TIMEOUT_MS = 500
+const REDIS_WARN_INTERVAL_MS = 60_000
+
+// Atomic fixed window: count the hit, start the window on the first hit, return [count, ttl ms].
+const REDIS_WINDOW_SCRIPT = `
+local count = redis.call("INCR", KEYS[1])
+local ttl = redis.call("PTTL", KEYS[1])
+if ttl < 0 then
+  redis.call("PEXPIRE", KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
+return {count, ttl}
+`
 
 let lastSweepAt = 0
+let lastRedisWarnAt = 0
 
 function bucketMap() {
   const g = globalThis as unknown as { __sunnyviewRateLimitBuckets?: Map<string, RateBucket> }
@@ -48,7 +68,8 @@ function evictLeastRecentlyUsed() {
   }
 }
 
-export function takeRateLimitToken(opts: { key: string; limit: number; windowMs: number }): RateLimitResult {
+/** Per-instance in-memory limiter; also the fallback when Redis is unavailable. */
+export function takeLocalRateLimitToken(opts: RateLimitOptions): RateLimitResult {
   const now = Date.now()
   sweepExpired(now)
 
@@ -67,6 +88,55 @@ export function takeRateLimitToken(opts: { key: string; limit: number; windowMs:
     return { ok: false, retryAfterSec: Math.max(1, Math.ceil((active.resetAt - now) / 1000)) }
   }
   return { ok: true, retryAfterSec: 0 }
+}
+
+function warnRedisFallback(error: unknown) {
+  const now = Date.now()
+  if (now - lastRedisWarnAt < REDIS_WARN_INTERVAL_MS) return
+  lastRedisWarnAt = now
+  console.warn("[rate-limit] redis unavailable, using in-memory limiter", {
+    message: error instanceof Error ? error.message : String(error),
+  })
+}
+
+async function evalWithTimeout(run: () => Promise<unknown>): Promise<unknown> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${REDIS_TIMEOUT_MS}ms`)), REDIS_TIMEOUT_MS)
+  })
+  const pending = run()
+  pending.catch(() => {}) // a late failure after the timeout must not become an unhandled rejection
+  try {
+    return await Promise.race([pending, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function parseWindowReply(reply: unknown): { count: number; ttlMs: number } | null {
+  if (!Array.isArray(reply) || reply.length < 2) return null
+  const count = Number(reply[0])
+  const ttlMs = Number(reply[1])
+  return Number.isFinite(count) && Number.isFinite(ttlMs) ? { count, ttlMs } : null
+}
+
+/** Shared limiter: Redis fixed window when configured, otherwise the in-memory limiter. */
+export async function takeRateLimitToken(opts: RateLimitOptions): Promise<RateLimitResult> {
+  const redis = await getRedis()
+  if (!redis) return takeLocalRateLimitToken(opts)
+
+  try {
+    const reply = await evalWithTimeout(() =>
+      redis.eval(REDIS_WINDOW_SCRIPT, [`${REDIS_KEY_PREFIX}${opts.key}`], [opts.windowMs])
+    )
+    const counter = parseWindowReply(reply)
+    if (!counter) throw new Error("unexpected redis reply")
+    if (counter.count <= opts.limit) return { ok: true, retryAfterSec: 0 }
+    return { ok: false, retryAfterSec: Math.max(1, Math.ceil(counter.ttlMs / 1000)) }
+  } catch (error) {
+    warnRedisFallback(error)
+    return takeLocalRateLimitToken(opts)
+  }
 }
 
 /**

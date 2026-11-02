@@ -19,7 +19,7 @@ function looksLikeElevenLabsKey(value: string) {
 
 export async function POST(req: Request) {
   const clientKey = requestClientKey(req.headers)
-  const rate = takeRateLimitToken({
+  const rate = await takeRateLimitToken({
     key: `elevenlabs-validate:${clientKey}`,
     limit: RATE_LIMIT_MAX,
     windowMs: RATE_LIMIT_WINDOW_MS,

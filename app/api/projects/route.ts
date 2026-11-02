@@ -16,7 +16,7 @@ export const runtime = "nodejs"
 const CREATE_RATE_LIMIT_MAX = 20
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  const limited = rateLimitResponse(req, "create", CREATE_RATE_LIMIT_MAX)
+  const limited = await rateLimitResponse(req, "create", CREATE_RATE_LIMIT_MAX)
   if (limited) return limited
 
   const visitor = getOrCreateVisitorContext(req)

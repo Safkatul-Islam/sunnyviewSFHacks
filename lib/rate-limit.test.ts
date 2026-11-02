@@ -1,12 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { requestClientKey, takeRateLimitToken } from "./rate-limit"
+import { requestClientKey, takeLocalRateLimitToken, takeRateLimitToken } from "./rate-limit"
+
+const redisMock = vi.hoisted(() => ({ getRedis: vi.fn() }))
+vi.mock("@/lib/redis", () => redisMock)
 
 function reset() {
   delete (globalThis as unknown as { __sunnyviewRateLimitBuckets?: unknown }).__sunnyviewRateLimitBuckets
 }
 
-describe("takeRateLimitToken", () => {
+function bucketCount() {
+  return (globalThis as unknown as { __sunnyviewRateLimitBuckets?: Map<string, unknown> }).__sunnyviewRateLimitBuckets?.size ?? 0
+}
+
+describe("takeLocalRateLimitToken", () => {
   beforeEach(() => {
     reset()
     vi.useFakeTimers()
@@ -19,56 +26,111 @@ describe("takeRateLimitToken", () => {
 
   it("allows up to the limit then blocks with retryAfterSec", () => {
     const opts = { key: "k", limit: 2, windowMs: 60_000 }
-    expect(takeRateLimitToken(opts)).toEqual({ ok: true, retryAfterSec: 0 })
-    expect(takeRateLimitToken(opts).ok).toBe(true)
+    expect(takeLocalRateLimitToken(opts)).toEqual({ ok: true, retryAfterSec: 0 })
+    expect(takeLocalRateLimitToken(opts).ok).toBe(true)
     vi.advanceTimersByTime(10_500)
-    const blocked = takeRateLimitToken(opts)
+    const blocked = takeLocalRateLimitToken(opts)
     expect(blocked.ok).toBe(false)
     expect(blocked.retryAfterSec).toBe(50)
   })
 
   it("resets after the window", () => {
     const opts = { key: "k", limit: 1, windowMs: 1000 }
-    expect(takeRateLimitToken(opts).ok).toBe(true)
-    expect(takeRateLimitToken(opts).ok).toBe(false)
+    expect(takeLocalRateLimitToken(opts).ok).toBe(true)
+    expect(takeLocalRateLimitToken(opts).ok).toBe(false)
     vi.advanceTimersByTime(1001)
-    expect(takeRateLimitToken(opts).ok).toBe(true)
+    expect(takeLocalRateLimitToken(opts).ok).toBe(true)
   })
 
   it("keeps keys independent and retryAfterSec at least 1", () => {
     const a = { key: "a", limit: 1, windowMs: 100 }
-    takeRateLimitToken(a)
-    expect(takeRateLimitToken({ ...a, key: "b" }).ok).toBe(true)
-    expect(takeRateLimitToken(a).retryAfterSec).toBe(1)
+    takeLocalRateLimitToken(a)
+    expect(takeLocalRateLimitToken({ ...a, key: "b" }).ok).toBe(true)
+    expect(takeLocalRateLimitToken(a).retryAfterSec).toBe(1)
   })
 
   it("sweeps expired buckets only periodically, but still honours expiry on access", () => {
     const g = globalThis as unknown as { __sunnyviewRateLimitBuckets: Map<string, unknown> }
-    takeRateLimitToken({ key: "old", limit: 1, windowMs: 10 })
+    takeLocalRateLimitToken({ key: "old", limit: 1, windowMs: 10 })
     vi.advanceTimersByTime(31_000)
-    takeRateLimitToken({ key: "new", limit: 1, windowMs: 100_000 })
+    takeLocalRateLimitToken({ key: "new", limit: 1, windowMs: 100_000 })
     expect(g.__sunnyviewRateLimitBuckets.has("old")).toBe(false)
 
-    takeRateLimitToken({ key: "short", limit: 1, windowMs: 10 })
+    takeLocalRateLimitToken({ key: "short", limit: 1, windowMs: 10 })
     vi.advanceTimersByTime(20)
     // inside the sweep interval: the stale bucket stays in the map ...
-    takeRateLimitToken({ key: "other", limit: 1, windowMs: 100_000 })
+    takeLocalRateLimitToken({ key: "other", limit: 1, windowMs: 100_000 })
     expect(g.__sunnyviewRateLimitBuckets.has("short")).toBe(true)
     // ... but is treated as expired when touched
-    expect(takeRateLimitToken({ key: "short", limit: 1, windowMs: 10 }).ok).toBe(true)
+    expect(takeLocalRateLimitToken({ key: "short", limit: 1, windowMs: 10 }).ok).toBe(true)
   })
 
   it("caps the map size and evicts least-recently-used buckets first", () => {
     const g = globalThis as unknown as { __sunnyviewRateLimitBuckets: Map<string, unknown> }
     const long = { limit: 1, windowMs: 600_000 }
-    takeRateLimitToken({ key: "hot", ...long })
-    for (let i = 0; i < 3990; i++) takeRateLimitToken({ key: `bulk:${i}`, ...long })
-    takeRateLimitToken({ key: "hot", ...long }) // touch (blocked) -> becomes most recent
-    for (let i = 0; i < 100; i++) takeRateLimitToken({ key: `flood:${i}`, ...long })
+    takeLocalRateLimitToken({ key: "hot", ...long })
+    for (let i = 0; i < 3990; i++) takeLocalRateLimitToken({ key: `bulk:${i}`, ...long })
+    takeLocalRateLimitToken({ key: "hot", ...long }) // touch (blocked) -> becomes most recent
+    for (let i = 0; i < 100; i++) takeLocalRateLimitToken({ key: `flood:${i}`, ...long })
     expect(g.__sunnyviewRateLimitBuckets.size).toBeLessThanOrEqual(4000)
     expect(g.__sunnyviewRateLimitBuckets.has("hot")).toBe(true)
     expect(g.__sunnyviewRateLimitBuckets.has("bulk:0")).toBe(false)
     expect(g.__sunnyviewRateLimitBuckets.has("flood:99")).toBe(true)
+  })
+})
+
+describe("takeRateLimitToken", () => {
+  const opts = { key: "route:1.2.3.4", limit: 2, windowMs: 60_000 }
+
+  beforeEach(() => {
+    reset()
+    redisMock.getRedis.mockReset()
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+  })
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+    reset()
+  })
+
+  it("uses the in-memory limiter when Redis is not configured", async () => {
+    redisMock.getRedis.mockResolvedValue(null)
+    expect((await takeRateLimitToken(opts)).ok).toBe(true)
+    expect((await takeRateLimitToken(opts)).ok).toBe(true)
+    expect(await takeRateLimitToken(opts)).toEqual({ ok: false, retryAfterSec: 60 })
+  })
+
+  it("counts in a shared Redis window keyed by route and client", async () => {
+    const counts = new Map<string, number>()
+    const evalFn = vi.fn(async (_script: string, keys: string[], args: unknown[]) => {
+      const n = (counts.get(keys[0]!) ?? 0) + 1
+      counts.set(keys[0]!, n)
+      return [n, Number(args[0]) - 1500]
+    })
+    redisMock.getRedis.mockResolvedValue({ eval: evalFn })
+    expect(await takeRateLimitToken(opts)).toEqual({ ok: true, retryAfterSec: 0 })
+    expect(await takeRateLimitToken(opts)).toEqual({ ok: true, retryAfterSec: 0 })
+    expect(await takeRateLimitToken(opts)).toEqual({ ok: false, retryAfterSec: 59 })
+    expect(evalFn).toHaveBeenCalledWith(expect.stringContaining("INCR"), ["sv:rl:route:1.2.3.4"], [60_000])
+    expect(bucketCount()).toBe(0)
+  })
+
+  it("falls back to the in-memory limiter when Redis errors or replies oddly", async () => {
+    redisMock.getRedis.mockResolvedValue({ eval: vi.fn().mockRejectedValue(new Error("down")) })
+    expect((await takeRateLimitToken(opts)).ok).toBe(true)
+    redisMock.getRedis.mockResolvedValue({ eval: vi.fn().mockResolvedValue("OK") })
+    expect((await takeRateLimitToken(opts)).ok).toBe(true)
+    expect(await takeRateLimitToken(opts)).toEqual({ ok: false, retryAfterSec: 60 })
+    expect(console.warn).toHaveBeenCalledTimes(1)
+  })
+
+  it("falls back when Redis is slower than the timeout", async () => {
+    vi.useFakeTimers()
+    redisMock.getRedis.mockResolvedValue({ eval: () => new Promise(() => {}) })
+    const pending = takeRateLimitToken(opts)
+    await vi.advanceTimersByTimeAsync(600)
+    expect(await pending).toEqual({ ok: true, retryAfterSec: 0 })
+    expect(bucketCount()).toBe(1)
   })
 })
 
