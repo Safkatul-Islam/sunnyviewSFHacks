@@ -7,6 +7,8 @@ beforeEach(() => {
   redisCtor.mockReset()
   vi.stubEnv("UPSTASH_REDIS_REST_URL", "")
   vi.stubEnv("UPSTASH_REDIS_REST_TOKEN", "")
+  vi.stubEnv("KV_REST_API_URL", "")
+  vi.stubEnv("KV_REST_API_TOKEN", "")
 })
 afterEach(() => {
   vi.unstubAllEnvs()
@@ -38,6 +40,21 @@ describe("getRedis", () => {
     expect(b).toBe(a)
     expect(redisCtor).toHaveBeenCalledTimes(1)
     expect(redisCtor).toHaveBeenCalledWith({ url: "https://r", token: "tok" })
+  })
+
+  it("accepts the KV_REST_API_* names set by Vercel integrations", async () => {
+    vi.doMock("@upstash/redis", () => ({
+      Redis: class {
+        constructor(opts: unknown) {
+          redisCtor(opts)
+        }
+      },
+    }))
+    vi.stubEnv("KV_REST_API_URL", "https://kv")
+    vi.stubEnv("KV_REST_API_TOKEN", "kvtok")
+    const { getRedis } = await import("@/lib/redis")
+    expect(await getRedis()).not.toBeNull()
+    expect(redisCtor).toHaveBeenCalledWith({ url: "https://kv", token: "kvtok" })
   })
 
   it("returns null when the module has no Redis export", async () => {
