@@ -42,7 +42,7 @@ function withVisitorCookie(payload: unknown, visitor: ReturnType<typeof getOrCre
 
 export async function GET(req: NextRequest, ctx: RouteContext) {
   const clientKey = requestClientKey(req.headers)
-  const rate = takeRateLimitToken({
+  const rate = await takeRateLimitToken({
     key: `history:detail:${clientKey}`,
     limit: DETAIL_RATE_LIMIT_MAX,
     windowMs: RATE_LIMIT_WINDOW_MS,
@@ -78,7 +78,7 @@ export async function GET(req: NextRequest, ctx: RouteContext) {
 
 export async function PATCH(req: NextRequest, ctx: RouteContext) {
   const clientKey = requestClientKey(req.headers)
-  const rate = takeRateLimitToken({
+  const rate = await takeRateLimitToken({
     key: `history:patch:${clientKey}`,
     limit: PATCH_RATE_LIMIT_MAX,
     windowMs: RATE_LIMIT_WINDOW_MS,
@@ -124,7 +124,7 @@ export async function PATCH(req: NextRequest, ctx: RouteContext) {
 
 export async function DELETE(req: NextRequest, ctx: RouteContext) {
   const clientKey = requestClientKey(req.headers)
-  const rate = takeRateLimitToken({
+  const rate = await takeRateLimitToken({
     key: `history:delete:${clientKey}`,
     limit: DELETE_RATE_LIMIT_MAX,
     windowMs: RATE_LIMIT_WINDOW_MS,
