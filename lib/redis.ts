@@ -1,13 +1,15 @@
 type AnyRedis = {
   get: <T = unknown>(key: string) => Promise<T | null>
   set: (key: string, value: unknown, opts?: { ex?: number }) => Promise<unknown>
+  eval: (script: string, keys: string[], args: unknown[]) => Promise<unknown>
 }
 
 let redisPromise: Promise<AnyRedis | null> | null = null
 
 export async function getRedis(): Promise<AnyRedis | null> {
-  const url = process.env.UPSTASH_REDIS_REST_URL?.trim()
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN?.trim()
+  // KV_REST_API_* is the naming used by Vercel's Upstash/KV integrations.
+  const url = (process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL)?.trim()
+  const token = (process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN)?.trim()
   if (!url || !token) return null
 
   if (!redisPromise) {
