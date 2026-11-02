@@ -9,7 +9,14 @@ import { spendBudgetResponse, takeSpendBudget } from "@/lib/spend-budget"
 export const runtime = "nodejs"
 
 const LOG_PREFIX = "[panel-recommend]"
-const MODEL_NOT_FOUND_RE = /not found|not supported|not available|unsupported model/i
+// Tried in order. gemini-2.5-flash is restricted to keys that used it before, so newer models go first.
+// gemini-3.6-flash spends the small output budget on thinking unless it is turned off.
+const GEMINI_MODELS: ReadonlyArray<{ name: string; generationConfig?: Record<string, unknown> }> = [
+  { name: "gemini-3.5-flash-lite" },
+  { name: "gemini-3.6-flash", generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+  { name: "gemini-2.5-flash" },
+]
+const MODEL_NOT_FOUND_RE = /not found|not supported|not available|no longer available|unsupported model/i
 const RATE_LIMIT_WINDOW_MS = 60_000
 const RATE_LIMIT_MAX = 8
 const MAX_BODY_BYTES = 64 * 1024
@@ -184,7 +191,7 @@ export async function POST(req: Request) {
   const envKey = process.env.GEMINI_API_KEY?.trim() || ""
   const key = (envKey || headerKey || bodyKey || "").trim()
   const usingServerKey = envKey.length > 0 && key === envKey
-  const modelsToTry = ["gemini-2.5-flash"]
+  const modelsToTry = GEMINI_MODELS.map((m) => m.name)
 
   const parsed = BodySchema.safeParse(body)
   if (!parsed.success) {
@@ -303,8 +310,11 @@ No extra keys, no markdown.`
   const attemptedModels: string[] = []
   let lastUpstreamError = "Gemini unavailable"
 
-  for (const modelName of modelsToTry) {
+  for (const { name: modelName, generationConfig } of GEMINI_MODELS) {
     attemptedModels.push(modelName)
+    const modelRequestBody = generationConfig
+      ? { ...requestBody, generationConfig: { ...requestBody.generationConfig, ...generationConfig } }
+      : requestBody
     const url = new URL(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent`
     )
@@ -321,7 +331,7 @@ No extra keys, no markdown.`
         method: "POST",
         signal: geminiAc.signal,
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(requestBody),
+        body: JSON.stringify(modelRequestBody),
       })
       json = (await res.json().catch(() => null)) as any
     } catch (e) {
@@ -332,6 +342,8 @@ No extra keys, no markdown.`
           : "Network error"
       lastUpstreamError = message
       console.error(`${LOG_PREFIX} request failed`, { model: modelName, message })
+      // A timeout already used the full budget; trying more models would multiply the wait.
+      if (geminiAc.signal.aborted) break
       continue
     } finally {
       clearTimeout(geminiTimeout)

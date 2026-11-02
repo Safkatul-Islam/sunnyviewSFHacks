@@ -85,7 +85,7 @@ describe("POST /api/panel-recommend", () => {
     const json = await res.json()
     expect(json.selectedId).toBe("p1")
     expect(json.why).toEqual(["a", "b"])
-    expect(json.usedModel).toBe("gemini-2.5-flash")
+    expect(json.usedModel).toBe("gemini-3.5-flash-lite")
 
     const urls = f.mock.calls.map((c) => c[0])
     expect(urls.some((u) => u.includes("evil.example"))).toBe(false)
@@ -157,6 +157,27 @@ describe("POST /api/panel-recommend", () => {
     expect((await parse.json()).error).toBe("Failed to parse Gemini JSON")
   })
 
+  it("falls back to the next model when one is unavailable to the key", async () => {
+    const gemini = vi.fn((init: RequestInit) => {
+      void init
+      return gemini.mock.calls.length === 1
+        ? Response.json({ error: { message: "This model is no longer available to new users." } }, { status: 400 })
+        : geminiOk()
+    })
+    const f = mockFetch({ gemini })
+    const res = await POST(req(VALID))
+    expect(res.status).toBe(200)
+    expect((await res.json()).usedModel).toBe("gemini-3.6-flash")
+    const calls = f.mock.calls.filter((c) => c[0].includes("generativelanguage"))
+    expect(calls.map((c) => new URL(c[0]).pathname.split("/").pop())).toEqual([
+      "gemini-3.5-flash-lite:generateContent",
+      "gemini-3.6-flash:generateContent",
+    ])
+    const [first, second] = calls.map((c) => JSON.parse(String(c[1]?.body)).generationConfig)
+    expect(first.thinkingConfig).toBeUndefined()
+    expect(second).toMatchObject({ maxOutputTokens: 300, thinkingConfig: { thinkingBudget: 0 } })
+  })
+
   it("502s when Gemini is rate limited (retryable) or the network fails", async () => {
     mockFetch({ gemini: () => Response.json({ error: { message: "quota" } }, { status: 429 }) })
     const limited = await POST(req(VALID))
@@ -185,7 +206,9 @@ describe("POST /api/panel-recommend", () => {
     await vi.advanceTimersByTimeAsync(25_100)
     const res = await p
     expect(res.status).toBe(502)
-    expect((await res.json()).error).toContain("timed out")
+    const json = await res.json()
+    expect(json.error).toContain("timed out")
+    expect(json.attemptedModels).toEqual(["gemini-3.5-flash-lite"])
   })
 
   it("429s after 8 requests with retry-after", async () => {
