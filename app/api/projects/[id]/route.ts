@@ -23,7 +23,7 @@ const PATCH_RATE_LIMIT_MAX = 90
 const NOT_FOUND = "Project not found."
 
 export async function GET(req: NextRequest, ctx: RouteContext): Promise<NextResponse> {
-  const limited = rateLimitResponse(req, "detail", DETAIL_RATE_LIMIT_MAX)
+  const limited = await rateLimitResponse(req, "detail", DETAIL_RATE_LIMIT_MAX)
   if (limited) return limited
 
   const visitor = getOrCreateVisitorContext(req)
@@ -47,7 +47,7 @@ export async function GET(req: NextRequest, ctx: RouteContext): Promise<NextResp
 }
 
 export async function PATCH(req: NextRequest, ctx: RouteContext): Promise<NextResponse> {
-  const limited = rateLimitResponse(req, "patch", PATCH_RATE_LIMIT_MAX)
+  const limited = await rateLimitResponse(req, "patch", PATCH_RATE_LIMIT_MAX)
   if (limited) return limited
 
   const visitor = getOrCreateVisitorContext(req)
