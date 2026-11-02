@@ -278,7 +278,7 @@ function buildFallbackDays(opts: { dcKw: number; pr: number }) {
 
 export async function GET(req: NextRequest) {
   const clientKey = requestClientKey(req.headers)
-  const rate = takeRateLimitToken({
+  const rate = await takeRateLimitToken({
     key: `forecast:${clientKey}`,
     limit: RATE_LIMIT_MAX,
     windowMs: RATE_LIMIT_WINDOW_MS,
