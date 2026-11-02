@@ -16,7 +16,7 @@ const SLUG_RE = /^[A-Za-z0-9_-]{10,64}$/
 const PUBLIC_CACHE_CONTROL = "public, max-age=15, s-maxage=30, stale-while-revalidate=60"
 
 export async function GET(req: NextRequest, ctx: RouteContext): Promise<NextResponse> {
-  const limited = rateLimitResponse(req, "share", SHARE_RATE_LIMIT_MAX)
+  const limited = await rateLimitResponse(req, "share", SHARE_RATE_LIMIT_MAX)
   if (limited) return limited
 
   const { slug } = await ctx.params
