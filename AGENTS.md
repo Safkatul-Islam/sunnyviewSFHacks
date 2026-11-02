@@ -156,7 +156,7 @@ For `services/segmenter/*` changes (Python), use:
 - Use `AbortController` timeouts for upstream calls.
 - Rate limiting: every route calls `takeRateLimitToken` from `lib/rate-limit.ts`, either directly (`requestClientKey` + `takeRateLimitToken`) or through `rateLimitResponse` in `lib/projects-http.ts` (projects and share routes).
   - Client key order (`requestClientKey`): `x-vercel-forwarded-for`, then `x-real-ip`, then the LAST `x-forwarded-for` entry, then `"unknown"`.
-  - The limiter is in-memory per instance (state on `globalThis`, capped at 4000 buckets). On multi-instance or serverless deployments, limits are best-effort.
+  - `takeRateLimitToken` is async. With Upstash Redis configured it uses a shared fixed-window counter in Redis (key prefix `sv:rl:`), so limits hold across serverless instances. Without Redis, or when Redis errors or takes over 500ms, it falls back to the in-memory limiter (`takeLocalRateLimitToken`, state on `globalThis`, capped at 4000 buckets), which is best-effort on multi-instance deployments.
 - Preserve bounded in-memory cache patterns (`globalThis` maps).
 - Keep logs concise; never log secrets/tokens.
 - Keep deterministic behavior for panel packing and geometry calculations.
@@ -173,7 +173,7 @@ Live features (server side):
 
 Optional:
 - `PVWATTS_BASE_URL`: full PVWatts JSON endpoint URL (default `https://developer.nlr.gov/api/pvwatts/v8.json`).
-- `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`: Redis cache for estimates (both required).
+- `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`: Redis cache for estimates and shared rate-limit counters (both required; `KV_REST_API_URL` / `KV_REST_API_TOKEN` are accepted too).
 - `SEGMENT_SERVICE_URL`: Python segmenter base URL. Outside production, the route probes `127.0.0.1:8000` and `localhost:8000`.
 - `SEGMENT_IMAGE_FETCH_ALLOWLIST`: comma-separated hostnames `/api/segment` may fetch images from. Private hosts are always blocked.
 - `OVERPASS_URL`: comma-separated Overpass `/api/interpreter` URLs tried before the public instances for `/api/segment` building footprints (for example a self-hosted or keyed instance). Server-only; may contain an API key.
