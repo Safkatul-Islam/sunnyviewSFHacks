@@ -204,7 +204,8 @@ export function SunnyviewExperience() {
 
   const shareDisabledReason = shareSlug ? null : (project.projectError ?? "Create a project to enable sharing.");
   // Local keys are only forwarded same-origin, so the hint only applies there.
-  const showElevenLabsHint = talk.hasLocalElevenLabsKey === false && apiRequestsAreSameOrigin();
+  // Only nudge for a key after the backend reports Talk has none; a server-side key needs no hint.
+  const showElevenLabsHint = talk.ttsNeedsKey && talk.hasLocalElevenLabsKey === false && apiRequestsAreSameOrigin();
 
   const setupPanel = (
     <SetupPanel
