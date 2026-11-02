@@ -8,8 +8,8 @@ import { requestClientKey, takeRateLimitToken } from "@/lib/rate-limit"
 export const PROJECTS_MAX_BODY_BYTES = 250_000
 export const PROJECTS_RATE_WINDOW_MS = 60_000
 
-export function rateLimitResponse(req: NextRequest, scope: string, limit: number) {
-  const rate = takeRateLimitToken({
+export async function rateLimitResponse(req: NextRequest, scope: string, limit: number): Promise<NextResponse | null> {
+  const rate = await takeRateLimitToken({
     key: `projects:${scope}:${requestClientKey(req.headers)}`,
     limit,
     windowMs: PROJECTS_RATE_WINDOW_MS,
