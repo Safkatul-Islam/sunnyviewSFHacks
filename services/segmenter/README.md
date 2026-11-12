@@ -17,6 +17,14 @@ pip install -r requirements.txt
 uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
+Or run it in Docker (from this directory). Publishing on `127.0.0.1` keeps it local-only:
+
+```bash
+docker build -t sunnyview-segmenter .
+docker run --rm -p 127.0.0.1:8000:8000 sunnyview-segmenter
+# Add --build-arg WITH_ONNX=1 to the build to include onnxruntime.
+```
+
 Then set in your Next app (root `.env.local`):
 
 ```bash

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+tests/
+requirements-train.txt
+Dockerfile
+.dockerignore
