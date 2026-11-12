@@ -23,6 +23,8 @@ export default defineConfig({
         "test/**",
       ],
       reporter: ["text-summary", "text"],
+      // CI fails if coverage drops below these floors (currently ~90% lines, ~91% branches).
+      thresholds: { lines: 85, statements: 85, branches: 85, functions: 90 },
     },
   },
 })
