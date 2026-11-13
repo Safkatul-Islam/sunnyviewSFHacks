@@ -2,6 +2,7 @@ import { clamp, toFiniteNumber } from "@/lib/geo/math"
 import { asRecord } from "@/lib/geo/narrow"
 import { mercatorToPixel, mercatorUnproject, pixelToMercator, type StaticMapTransform } from "@/lib/geo/mercator"
 import { parseAddressHints } from "@/lib/segment/address"
+import { getCachedBuildingLookup, setCachedBuildingLookup } from "@/lib/segment/building-lookup-cache"
 import { extractGeojsonRingNorm, roiFromPixelPoints, type PixelRoi } from "@/lib/segment/geometry"
 import { looksLikeBuildingHit, nominatimFootprintElement, nominatimReverse } from "@/lib/segment/nominatim"
 import {
@@ -145,11 +146,91 @@ export type LocatedBuildings = {
   pick: ReturnType<typeof pickTopOrCandidates>
 }
 
+type GatheredBuildings = { elements: OverpassElement[]; complete: boolean }
+
+type NominatimStep = { reverseElements: OverpassElement[]; nominatimElement: OverpassElement | null; ok: boolean }
+
 /**
- * OSM building lookup around the focus point: Nominatim reverse -> Overpass by id,
- * nearby buildings, and house-number tagged buildings, then ranking.
+ * Nominatim reverse, plus the Overpass by-id element when it found a building without a usable
+ * footprint. `ok` is false when the reverse or by-id call failed (not when it merely found no building).
+ */
+async function resolveNominatimStep(opts: {
+  focus: { lat: number; lng: number }
+  startedAt: number
+  signal: AbortSignal
+}): Promise<NominatimStep> {
+  const { focus, startedAt, signal } = opts
+  let reverseElements: OverpassElement[] = []
+  let nominatimElement: OverpassElement | null = null
+  try {
+    const rev = await nominatimReverse({ lat: focus.lat, lng: focus.lng, signal })
+    nominatimElement = nominatimFootprintElement(rev)
+    // With an accepted footprint the by-id element is already in hand (and nearby would return it too).
+    const needsById = !nominatimElement && looksLikeBuildingHit(rev)
+    if (needsById && (rev.osmType === "way" || rev.osmType === "relation") && rev.osmId) {
+      const deadline = startedAt + OSM_LOOKUP_BUDGET_MS
+      reverseElements = await fetchOverpassByOsmId({ osmType: rev.osmType, osmId: rev.osmId, signal, deadline })
+    }
+  } catch {
+    return { reverseElements, nominatimElement, ok: false }
+  }
+  return { reverseElements, nominatimElement, ok: true }
+}
+
+/**
+ * Nominatim reverse -> Overpass by id, nearby buildings, and house-number tagged buildings.
  * Individual upstream failures, timeouts and aborts are ignored so whatever was already gathered
- * (including the Nominatim footprint) is still ranked; only transform/ranking errors propagate.
+ * (including the Nominatim footprint) is kept. `complete` is true only when every upstream call
+ * that ran (reverse, by-id, nearby and, if needed, house-number) was answered.
+ */
+async function gatherBuildingElements(opts: {
+  focus: { lat: number; lng: number }
+  houseNumber: string | undefined
+  startedAt: number
+  signal: AbortSignal
+}): Promise<GatheredBuildings> {
+  const { focus, houseNumber, startedAt, signal } = opts
+
+  // 1) Nominatim reverse. Its footprint geometry also serves as a candidate when Overpass is down.
+  const { reverseElements, nominatimElement, ok } = await resolveNominatimStep({ focus, startedAt, signal })
+  let complete = ok
+  const deadline = nominatimElement
+    ? Math.min(startedAt + OSM_LOOKUP_BUDGET_MS, Date.now() + OSM_LOOKUP_GRACE_MS)
+    : startedAt + OSM_LOOKUP_BUDGET_MS
+
+  // 2) Always also fetch nearby buildings (reverse can be wrong in dense areas).
+  let nearbyElements: OverpassElement[] = []
+  try {
+    nearbyElements = await fetchOverpassBuildings({ lat: focus.lat, lng: focus.lng, radiusM: 200, signal, deadline })
+  } catch {
+    complete = false
+  }
+  let elements = reverseElements.concat(nearbyElements)
+
+  // 3) If we have an address number, also query addr-tagged buildings.
+  if (houseNumber) {
+    try {
+      const tagged = await fetchOverpassByHouseNumber({
+        lat: focus.lat,
+        lng: focus.lng,
+        radiusM: 260,
+        houseNumber,
+        signal,
+        deadline,
+      })
+      if (tagged.length) elements = elements.concat(tagged)
+    } catch {
+      complete = false
+    }
+  }
+
+  return { elements: mergeBuildingElements(elements, nominatimElement), complete }
+}
+
+/**
+ * OSM building lookup around the focus point (see gatherBuildingElements), then ranking.
+ * The finished element list is cached per location and house number, so a repeat lookup skips
+ * Nominatim and Overpass; ranking always runs fresh. Only transform/ranking errors propagate.
  */
 export async function locateBuildings(opts: {
   meta: MapMeta
@@ -170,55 +251,15 @@ export async function locateBuildings(opts: {
   const posClick = Array.isArray(opts.clicks) ? opts.clicks.find((c) => c.type === "pos") : null
   const focusPx = posClick ? { x: posClick.x, y: posClick.y } : { x: meta.widthPx / 2, y: meta.heightPx / 2 }
   const focus = mercatorUnproject(pixelToMercator(focusPx, tf))
+  const houseNumber = parseAddressHints(meta.address)?.houseNumber || undefined
 
-  // 1) Try to resolve a likely building element via Nominatim reverse. Its footprint geometry
-  //    (polygon_geojson) also serves as a candidate when Overpass is down.
-  let reverseElements: OverpassElement[] = []
-  let nominatimElement: OverpassElement | null = null
-  try {
-    const rev = await nominatimReverse({ lat: focus.lat, lng: focus.lng, signal })
-    nominatimElement = nominatimFootprintElement(rev)
-    // With an accepted footprint the by-id element is already in hand (and nearby would return it too).
-    const needsById = !nominatimElement && looksLikeBuildingHit(rev)
-    if (needsById && (rev.osmType === "way" || rev.osmType === "relation") && rev.osmId) {
-      const deadline = startedAt + OSM_LOOKUP_BUDGET_MS
-      reverseElements = await fetchOverpassByOsmId({ osmType: rev.osmType, osmId: rev.osmId, signal, deadline })
-    }
-  } catch {
-    // ignore reverse failures
-  }
-  const deadline = nominatimElement
-    ? Math.min(startedAt + OSM_LOOKUP_BUDGET_MS, Date.now() + OSM_LOOKUP_GRACE_MS)
-    : startedAt + OSM_LOOKUP_BUDGET_MS
-
-  // 2) Always also fetch nearby buildings (reverse can be wrong in dense areas).
-  let nearbyElements: OverpassElement[] = []
-  try {
-    nearbyElements = await fetchOverpassBuildings({ lat: focus.lat, lng: focus.lng, radiusM: 200, signal, deadline })
-  } catch {
-    // ignore
-  }
-  let elements = reverseElements.concat(nearbyElements)
-
-  // 3) If we have an address number, also query addr-tagged buildings.
-  const hints = parseAddressHints(meta.address)
-  if (hints?.houseNumber) {
-    try {
-      const tagged = await fetchOverpassByHouseNumber({
-        lat: focus.lat,
-        lng: focus.lng,
-        radiusM: 260,
-        houseNumber: hints.houseNumber,
-        signal,
-        deadline,
-      })
-      if (tagged.length) elements = elements.concat(tagged)
-    } catch {
-      // ignore
-    }
+  let elements = await getCachedBuildingLookup({ lat: focus.lat, lng: focus.lng, houseNumber, signal })
+  if (!elements) {
+    const gathered = await gatherBuildingElements({ focus, houseNumber, startedAt, signal })
+    elements = gathered.elements
+    if (!signal.aborted) await setCachedBuildingLookup({ lat: focus.lat, lng: focus.lng, houseNumber, ...gathered })
   }
 
-  elements = mergeBuildingElements(elements, nominatimElement)
   const scored = rankBuildingCandidates({ elements, tf, focusPx, address: meta.address })
   return { tf, focusPx, scored, pick: pickTopOrCandidates(scored) }
 }

@@ -15,7 +15,10 @@ import {
 } from "@/lib/segment/osm-buildings"
 
 const redisMock = vi.hoisted(() => ({ getRedis: vi.fn() }))
-vi.mock("@/lib/redis", () => redisMock)
+vi.mock("@/lib/redis", async () => ({
+  ...(await vi.importActual<typeof import("@/lib/redis")>("@/lib/redis")),
+  getRedis: redisMock.getRedis,
+}))
 
 function squareGeom(lat0: number, lon0: number, d: number) {
   return [

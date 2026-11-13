@@ -83,6 +83,7 @@ beforeEach(() => {
   delete g.__sunnyviewRateLimitBuckets
   delete g.__sunnyviewOverpassCache
   delete g.__sunnyviewOverpassCooldown
+  delete g.__sunnyviewBuildingLookupCache
   delete g.__sunnyviewLocalSegmenterCache
   fetchMock = vi.fn()
   vi.stubGlobal("fetch", fetchMock)

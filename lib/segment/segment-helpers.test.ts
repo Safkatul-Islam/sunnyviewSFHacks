@@ -14,6 +14,12 @@ import {
 import { estimateDataUrlBytes, readBufferWithLimit } from "@/lib/segment/image"
 import { getAppOrigin, hostAllowed, isPrivateHostname, readHostAllowlist, resolveAllowedImageUrl } from "@/lib/segment/ssrf"
 
+const redisMock = vi.hoisted(() => ({ getRedis: vi.fn() }))
+vi.mock("@/lib/redis", async () => ({
+  ...(await vi.importActual<typeof import("@/lib/redis")>("@/lib/redis")),
+  getRedis: redisMock.getRedis,
+}))
+
 describe("segment/ssrf", () => {
   const original = process.env.SEGMENT_IMAGE_FETCH_ALLOWLIST
   afterEach(() => {
@@ -297,6 +303,8 @@ describe("segment/guidance locateBuildings time budget", () => {
   beforeEach(() => {
     delete g.__sunnyviewOverpassCache
     delete g.__sunnyviewOverpassCooldown
+    delete g.__sunnyviewBuildingLookupCache
+    redisMock.getRedis.mockReset().mockResolvedValue(null)
     overpassCalls = []
     fetchMock = vi.fn()
     vi.stubGlobal("fetch", fetchMock)
@@ -366,5 +374,112 @@ describe("segment/guidance locateBuildings time budget", () => {
     const located = await p
     expect(located.scored.map((c) => c.id)).toEqual(["way:7"])
     expect(overpassCalls.filter((q) => q.includes("addr:housenumber"))).toHaveLength(1)
+  })
+
+  describe("finished lookup cache", () => {
+    const LOOKUP_PREFIX = "sv:osm-lookup:"
+    const DAY_SEC = 24 * 60 * 60
+    let redisSet: ReturnType<typeof vi.fn>
+
+    const answerOverpass = (q: string) =>
+      Promise.resolve(Response.json({ elements: q.includes("addr:housenumber") ? [] : [OVERPASS_WAY_7] }))
+    const locate = () => locateBuildings({ meta: META, clicks: undefined, signal: new AbortController().signal })
+
+    function lookupWrites() {
+      return redisSet.mock.calls.filter(([key]) => String(key).startsWith(LOOKUP_PREFIX))
+    }
+
+    beforeEach(() => {
+      redisSet = vi.fn().mockResolvedValue("OK")
+      redisMock.getRedis.mockResolvedValue({ get: vi.fn().mockResolvedValue(null), set: redisSet })
+    })
+
+    it("answers a repeat lookup without any fetch and ranks the same buildings", async () => {
+      install(BUILDING_HIT, answerOverpass)
+      const first = await locate()
+      expect(fetchMock).toHaveBeenCalled()
+      fetchMock.mockClear()
+      const second = await locate()
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(second.scored.map((c) => c.id)).toEqual(first.scored.map((c) => c.id))
+    })
+
+    it("stores a full result for 30 days", async () => {
+      install(BUILDING_HIT, answerOverpass)
+      await locate()
+      expect(lookupWrites()).toHaveLength(1)
+      expect(lookupWrites()[0][1].complete).toBe(true)
+      expect(lookupWrites()[0][2]).toEqual({ ex: 30 * DAY_SEC })
+    })
+
+    it("stores a Nominatim-only result for 1 day when Overpass fails", async () => {
+      install(BUILDING_HIT, () => Promise.resolve(new Response("down", { status: 500 })))
+      const p = locate()
+      await vi.advanceTimersByTimeAsync(OSM_LOOKUP_GRACE_MS + 50)
+      expect((await p).scored[0]?.id).toBe("nominatim:way:41")
+      expect(lookupWrites()).toHaveLength(1)
+      expect(lookupWrites()[0][1].complete).toBe(false)
+      expect(lookupWrites()[0][2]).toEqual({ ex: DAY_SEC })
+    })
+
+    it("stores the result for 1 day when Nominatim reverse fails but Overpass answers", async () => {
+      fetchMock.mockImplementation(async (input: unknown, init: RequestInit = {}) => {
+        if (String(input).includes("nominatim.openstreetmap.org")) return new Response("busy", { status: 429 })
+        const query = new URLSearchParams(String(init.body ?? "")).get("data") ?? ""
+        return await answerOverpass(query)
+      })
+      expect((await locate()).scored.map((c) => c.id)).toEqual(["way:7"])
+      expect(lookupWrites()).toHaveLength(1)
+      expect(lookupWrites()[0][1].complete).toBe(false)
+      expect(lookupWrites()[0][2]).toEqual({ ex: DAY_SEC })
+    })
+
+    it("stores the result for 30 days when Nominatim simply finds no building", async () => {
+      install({}, answerOverpass)
+      await locate()
+      expect(lookupWrites()[0][2]).toEqual({ ex: 30 * DAY_SEC })
+    })
+
+    it("stores the result for 1 day when the by-id Overpass call fails", async () => {
+      const noFootprint = { osm_type: "way", osm_id: 41, category: "building", type: "house" }
+      install(noFootprint, (q) =>
+        q.includes("way(41)") ? Promise.resolve(new Response("bad", { status: 400 })) : answerOverpass(q)
+      )
+      expect((await locate()).scored.map((c) => c.id)).toEqual(["way:7"])
+      expect(lookupWrites()).toHaveLength(1)
+      expect(lookupWrites()[0][1].complete).toBe(false)
+      expect(lookupWrites()[0][2]).toEqual({ ex: DAY_SEC })
+    })
+
+    it("stores the result for 1 day when the house-number query fails", async () => {
+      install(BUILDING_HIT, (q) =>
+        q.includes("addr:housenumber")
+          ? Promise.resolve(new Response("down", { status: 500 }))
+          : Promise.resolve(Response.json({ elements: [OVERPASS_WAY_7] }))
+      )
+      await locate()
+      expect(lookupWrites()).toHaveLength(1)
+      expect(lookupWrites()[0][1].complete).toBe(false)
+      expect(lookupWrites()[0][2]).toEqual({ ex: DAY_SEC })
+    })
+
+    it("does not store a lookup that was aborted", async () => {
+      install({}, (q, init) => (q.includes("addr:housenumber") ? hang(init) : answerOverpass(q)))
+      const ac = new AbortController()
+      const p = locateBuildings({ meta: META, clicks: undefined, signal: ac.signal })
+      await vi.advanceTimersByTimeAsync(500)
+      ac.abort()
+      expect((await p).scored.map((c) => c.id)).toEqual(["way:7"])
+      expect(lookupWrites()).toHaveLength(0)
+    })
+
+    it("does not cache an empty result", async () => {
+      install({}, () => Promise.resolve(Response.json({ elements: [] })))
+      expect((await locate()).scored).toEqual([])
+      expect(lookupWrites()).toHaveLength(0)
+      fetchMock.mockClear()
+      await locate()
+      expect(fetchMock).toHaveBeenCalled()
+    })
   })
 })

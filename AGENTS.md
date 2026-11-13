@@ -173,7 +173,7 @@ Live features (server side):
 
 Optional:
 - `PVWATTS_BASE_URL`: full PVWatts JSON endpoint URL (default `https://developer.nlr.gov/api/pvwatts/v8.json`).
-- `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`: Redis cache for estimates, OSM building footprints (`sv:osm:`, 30 days) and shared rate-limit counters (both required; `KV_REST_API_URL` / `KV_REST_API_TOKEN` are accepted too).
+- `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`: Redis cache for estimates, OSM building footprints (`sv:osm:`, 30 days), finished building lookups (`sv:osm-lookup:`, 30 days, or 1 day when Overpass did not answer) and shared rate-limit counters (both required; `KV_REST_API_URL` / `KV_REST_API_TOKEN` are accepted too).
 - `SEGMENT_SERVICE_URL`: Python segmenter base URL. Outside production, the route probes `127.0.0.1:8000` and `localhost:8000`.
 - `SEGMENT_IMAGE_FETCH_ALLOWLIST`: comma-separated hostnames `/api/segment` may fetch images from. Private hosts are always blocked.
 - `OVERPASS_URL`: comma-separated Overpass `/api/interpreter` URLs for `/api/segment` building footprints, started before the public instances (for example a self-hosted or keyed instance). Endpoints are raced: the next one starts when one fails or after 2s without an answer. Server-only; may contain an API key.

@@ -79,3 +79,19 @@ describe("getRedis", () => {
     expect(await getRedis()).toBeNull()
   })
 })
+
+describe("withRedisTimeout", () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("resolves null and clears its timer when the call throws synchronously", async () => {
+    vi.useFakeTimers()
+    const { withRedisTimeout } = await import("@/lib/redis")
+    const result = await withRedisTimeout(() => {
+      throw new Error("sync boom")
+    })
+    expect(result).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+})

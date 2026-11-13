@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 
 import { toFiniteNumber } from "@/lib/geo/math"
-import { getRedis } from "@/lib/redis"
+import { getRedis, REDIS_TIMEOUT_MS, withRedisTimeout } from "@/lib/redis"
 import { parseAddressHints, scoreAddrMatch, type AddressHints } from "@/lib/segment/address"
 import {
   mercatorProject,
@@ -53,28 +53,12 @@ function cacheSet(key: string, entry: CacheEntry) {
 // change, so successful footprint queries are kept for 30 days. Redis is best-effort: slow or
 // failing calls are skipped so they never block or break a lookup.
 export const OVERPASS_REDIS_TTL_SEC = 30 * 24 * 60 * 60
-export const OVERPASS_REDIS_TIMEOUT_MS = 500
+export const OVERPASS_REDIS_TIMEOUT_MS = REDIS_TIMEOUT_MS
 export const OVERPASS_REDIS_MAX_BYTES = 512 * 1024
 const OVERPASS_REDIS_PREFIX = "sv:osm:"
 
 function redisKeyForQuery(query: string) {
   return OVERPASS_REDIS_PREFIX + createHash("sha256").update(query).digest("hex")
-}
-
-async function withRedisTimeout<T>(run: () => Promise<T>): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), OVERPASS_REDIS_TIMEOUT_MS)
-  })
-  const pending = run()
-  pending.catch(() => {}) // a late failure after the timeout must not become an unhandled rejection
-  try {
-    return await Promise.race([pending, timeout])
-  } catch {
-    return null
-  } finally {
-    clearTimeout(timer)
-  }
 }
 
 async function redisGetElements(query: string): Promise<OverpassElement[] | null> {

@@ -30,3 +30,25 @@ export async function getRedis(): Promise<AnyRedis | null> {
 
   return redisPromise
 }
+
+export const REDIS_TIMEOUT_MS = 500
+
+/**
+ * Runs a best-effort Redis call: resolves null when it takes longer than REDIS_TIMEOUT_MS or fails,
+ * so a slow or broken Redis never blocks or breaks the caller.
+ */
+export async function withRedisTimeout<T>(run: () => Promise<T>): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), REDIS_TIMEOUT_MS)
+  })
+  try {
+    const pending = run()
+    pending.catch(() => {}) // a late failure after the timeout must not become an unhandled rejection
+    return await Promise.race([pending, timeout])
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
