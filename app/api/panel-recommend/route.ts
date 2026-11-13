@@ -17,6 +17,13 @@ const GEMINI_MODELS: ReadonlyArray<{ name: string; generationConfig?: Record<str
   { name: "gemini-2.5-flash" },
 ]
 const MODEL_NOT_FOUND_RE = /not found|not supported|not available|no longer available|unsupported model/i
+// Capacity is per model, so an overloaded model is worth skipping rather than failing the request.
+const MODEL_OVERLOADED_RE = /overloaded|high demand|unavailable|try again later/i
+const RETRYABLE_MODEL_STATUSES = new Set([404, 429, 500, 502, 503, 504])
+
+function canTryNextModel(status: number, message: string): boolean {
+  return RETRYABLE_MODEL_STATUSES.has(status) || MODEL_NOT_FOUND_RE.test(message) || MODEL_OVERLOADED_RE.test(message)
+}
 const RATE_LIMIT_WINDOW_MS = 60_000
 const RATE_LIMIT_MAX = 8
 const MAX_BODY_BYTES = 64 * 1024
@@ -360,8 +367,7 @@ No extra keys, no markdown.`
         status: res.status,
         message: msg.slice(0, 240),
       })
-      const canRetryModel = res.status === 404 || res.status === 429 || MODEL_NOT_FOUND_RE.test(msg)
-      if (canRetryModel) continue
+      if (canTryNextModel(res.status, msg)) continue
       return NextResponse.json(
         { error: msg, attemptedModels },
         { status: res.status >= 400 && res.status < 600 ? res.status : 502 }

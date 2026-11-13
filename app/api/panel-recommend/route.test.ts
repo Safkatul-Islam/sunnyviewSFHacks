@@ -178,6 +178,60 @@ describe("POST /api/panel-recommend", () => {
     expect(second).toMatchObject({ maxOutputTokens: 300, thinkingConfig: { thinkingBudget: 0 } })
   })
 
+  const geminiModelsCalled = (f: ReturnType<typeof mockFetch>) =>
+    f.mock.calls
+      .filter((c) => c[0].includes("generativelanguage"))
+      .map((c) => new URL(c[0]).pathname.split("/").pop()?.replace(":generateContent", ""))
+
+  it.each([500, 502, 503, 504])("falls back to the next model when Gemini answers HTTP %i", async (status) => {
+    const gemini = vi.fn((init: RequestInit) => {
+      void init
+      return gemini.mock.calls.length === 1
+        ? Response.json(
+            { error: { code: status, message: "This model is currently experiencing high demand. Please try again later.", status: "UNAVAILABLE" } },
+            { status }
+          )
+        : geminiOk()
+    })
+    const f = mockFetch({ gemini })
+    const res = await POST(req(VALID))
+    expect(res.status).toBe(200)
+    expect((await res.json()).usedModel).toBe("gemini-3.6-flash")
+    expect(geminiModelsCalled(f)).toEqual(["gemini-3.5-flash-lite", "gemini-3.6-flash"])
+  })
+
+  it("falls back on an overload message even when the status is not 5xx", async () => {
+    const gemini = vi.fn((init: RequestInit) => {
+      void init
+      return gemini.mock.calls.length === 1
+        ? Response.json({ error: { message: "The model is overloaded. Please try again later." } }, { status: 400 })
+        : geminiOk()
+    })
+    const f = mockFetch({ gemini })
+    const res = await POST(req(VALID))
+    expect(res.status).toBe(200)
+    expect(geminiModelsCalled(f)).toEqual(["gemini-3.5-flash-lite", "gemini-3.6-flash"])
+  })
+
+  it("502s after trying every model when all of them are overloaded", async () => {
+    const f = mockFetch({
+      gemini: () => Response.json({ error: { message: "high demand", status: "UNAVAILABLE" } }, { status: 503 }),
+    })
+    const res = await POST(req(VALID))
+    expect(res.status).toBe(502)
+    const json = await res.json()
+    expect(json.error).toBe("high demand")
+    expect(json.attemptedModels).toEqual(["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash"])
+    expect(geminiModelsCalled(f)).toHaveLength(3)
+  })
+
+  it("does not try other models for a bad request", async () => {
+    const f = mockFetch({ gemini: () => Response.json({ error: { message: "Invalid JSON payload received." } }, { status: 400 }) })
+    const res = await POST(req(VALID))
+    expect(res.status).toBe(400)
+    expect(geminiModelsCalled(f)).toEqual(["gemini-3.5-flash-lite"])
+  })
+
   it("502s when Gemini is rate limited (retryable) or the network fails", async () => {
     mockFetch({ gemini: () => Response.json({ error: { message: "quota" } }, { status: 429 }) })
     const limited = await POST(req(VALID))
