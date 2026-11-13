@@ -128,6 +128,34 @@ def split_train_val(samples: List[RoofSatSample], val_frac: float, seed: int = 1
     return train, val
 
 
+def split_train_val_test(
+    samples: List[RoofSatSample],
+    val_frac: float,
+    test_frac: float,
+    seed: int = 1337,
+    test_seed: int = 2026,
+) -> Tuple[List[RoofSatSample], List[RoofSatSample], List[RoofSatSample]]:
+    """Hold out a fixed test set first, then split the rest into train/val.
+
+    The test set depends only on the sorted image paths and test_seed, so it stays the
+    same across runs that change val_frac, seed or hyperparameters. Checkpoint selection
+    uses val only; test is scored once after training. With test_frac=0 the train/val
+    split is identical to split_train_val(samples, val_frac, seed).
+    """
+    if not 0.0 <= test_frac < 1.0:
+        raise ValueError("test_frac must be in [0,1)")
+    paths = sorted(s.img_path for s in samples)
+    n_test = int(round(test_frac * len(paths)))
+    order = np.random.default_rng(test_seed).permutation(len(paths))
+    test_paths = {paths[i] for i in order[:n_test].tolist()}
+    test = [s for s in samples if s.img_path in test_paths]
+    rest = [s for s in samples if s.img_path not in test_paths]
+    if len(rest) < 2:
+        raise ValueError("test_frac leaves too few samples for train/val")
+    train, val = split_train_val(rest, val_frac, seed=seed)
+    return train, val, test
+
+
 def make_augmenter(kind: str) -> Optional[Callable[[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
     """Small aug wrapper; avoids hard import errors when albumentations isn't installed."""
 

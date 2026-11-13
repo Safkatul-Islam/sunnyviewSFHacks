@@ -36,3 +36,10 @@ structurizr/*.zip
 /test-results/
 /playwright-report/
 /blob-report/
+
+# Roof model training outputs (services/segmenter/train_roofsat)
+services/segmenter/train_roofsat/Roofsat/
+services/segmenter/train_roofsat/Roofsat.zip
+services/segmenter/train_roofsat/runs/
+services/segmenter/train_roofsat/mlruns/
+services/segmenter/train_roofsat/mlflow.db

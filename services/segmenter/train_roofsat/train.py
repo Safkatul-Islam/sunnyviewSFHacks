@@ -1,12 +1,13 @@
 import argparse
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
 
-from dataset import RoofSatSample, build_dataset_index, load_img_mask, make_augmenter, split_train_val
+from dataset import RoofSatSample, build_dataset_index, load_img_mask, make_augmenter, split_train_val_test
 
 
 def _require_torch():
@@ -35,6 +36,9 @@ class TrainConfig:
     target_iou: Optional[float]
     patience: int
     white_roof_p: float
+    test_frac: float
+    test_seed: int
+    num_workers: int
 
 
 def _seed_all(seed: int) -> None:
@@ -179,6 +183,95 @@ class _RoofSatTorchDataset:
         return x, y
 
 
+class _MlflowRun:
+    """Optional MLflow logging. Every method is a no-op when no tracking URI is given."""
+
+    def __init__(self, tracking_uri: Optional[str], experiment: str, run_name: Optional[str]):
+        self._mlflow = None
+        if not tracking_uri:
+            return
+        try:
+            import mlflow  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"mlflow is required for --mlflow-uri: {e}")
+        mlflow.set_tracking_uri(tracking_uri)
+        mlflow.set_experiment(experiment)
+        mlflow.start_run(run_name=run_name)
+        self._mlflow = mlflow
+
+    def params(self, values: dict) -> None:
+        if self._mlflow:
+            self._mlflow.log_params(values)
+
+    def metrics(self, values: dict, step: Optional[int] = None) -> None:
+        if self._mlflow:
+            self._mlflow.log_metrics({k: float(v) for k, v in values.items()}, step=step)
+
+    def tag(self, key: str, value: str) -> None:
+        if self._mlflow:
+            self._mlflow.set_tag(key, value)
+
+    def artifact(self, path: str) -> None:
+        if self._mlflow:
+            self._mlflow.log_artifact(path)
+
+    def end(self, status: str = "FINISHED") -> None:
+        if self._mlflow:
+            self._mlflow.end_run(status=status)
+
+
+def _score_split(model, samples: List[RoofSatSample], input_size: int, device) -> dict:
+    """Pixel-level IoU, Dice, precision and recall over center crops, plus mean per-image IoU."""
+    import torch  # type: ignore
+
+    ds = _RoofSatTorchDataset(samples, input_size, aug_kind="none", crop_mode="center", white_roof_p=0.0)
+    tp = fp = fn = 0
+    per_image: List[float] = []
+    model.eval()
+    with torch.no_grad():
+        for i in range(len(ds)):
+            x, y = ds[i]
+            logits = model(torch.as_tensor(x).unsqueeze(0).to(device))
+            pred = (torch.sigmoid(logits)[0, 0] >= 0.5).cpu().numpy()
+            truth = np.asarray(y)[0] > 0.5
+            inter = int((pred & truth).sum())
+            extra = int((pred & ~truth).sum())
+            missed = int((~pred & truth).sum())
+            tp, fp, fn = tp + inter, fp + extra, fn + missed
+            per_image.append(inter / max(1, inter + extra + missed))
+    return {
+        "test_pixel_iou": tp / max(1, tp + fp + fn),
+        "test_mean_image_iou": float(np.mean(per_image)) if per_image else 0.0,
+        "test_dice": 2 * tp / max(1, 2 * tp + fp + fn),
+        "test_precision": tp / max(1, tp + fp),
+        "test_recall": tp / max(1, tp + fn),
+    }
+
+
+def _evaluate_test(cfg: TrainConfig, test_s: List[RoofSatSample], best_path: str, device, tracker: _MlflowRun) -> None:
+    """Score best.pt once on the held-out test split and save the results next to it."""
+    import segmentation_models_pytorch as smp  # type: ignore
+    import torch  # type: ignore
+
+    ckpt = torch.load(best_path, map_location="cpu")
+    model = smp.Unet(encoder_name=ckpt["encoder"], encoder_weights=None, in_channels=3, classes=1, activation=None)
+    model.load_state_dict(ckpt["model_state"])
+    model.to(device)
+    results = {**_score_split(model, test_s, cfg.input_size, device), "best_epoch": int(ckpt["epoch"]), "best_val_iou": float(ckpt["val_iou"])}
+
+    metrics_path = os.path.join(cfg.out_dir, "test_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump({**results, "n_test": len(test_s)}, f, indent=2, sort_keys=True)
+    images_path = os.path.join(cfg.out_dir, "test_images.txt")
+    with open(images_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(os.path.basename(s.img_path) for s in test_s) + "\n")
+
+    tracker.metrics(results)
+    tracker.artifact(metrics_path)
+    tracker.artifact(images_path)
+    print(json.dumps({"event": "test", **{k: round(v, 5) if isinstance(v, float) else v for k, v in results.items()}}))
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -199,6 +292,12 @@ def main() -> None:
     p.add_argument("--target-iou", type=float, default=None, help="Stop early when val IoU >= this value")
     p.add_argument("--patience", type=int, default=7, help="Early stop after N epochs without improvement")
     p.add_argument("--white-roof-p", type=float, default=0.25, help="Prob of synthetic white-roof augmentation (0..1)")
+    p.add_argument("--test-frac", type=float, default=0.15, help="Fraction held out as a fixed test set (0 disables)")
+    p.add_argument("--test-seed", type=int, default=2026, help="Seed for the test split (independent of --seed)")
+    p.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (use 0 on Windows)")
+    p.add_argument("--mlflow-uri", default=None, help="MLflow tracking URI, e.g. sqlite:///mlflow.db (off when unset)")
+    p.add_argument("--mlflow-experiment", default="sunnyview-roofseg", help="MLflow experiment name")
+    p.add_argument("--run-name", default=None, help="MLflow run name")
     args = p.parse_args()
 
     cfg = TrainConfig(
@@ -215,6 +314,9 @@ def main() -> None:
         target_iou=float(args.target_iou) if args.target_iou is not None else None,
         patience=int(args.patience),
         white_roof_p=float(args.white_roof_p),
+        test_frac=float(args.test_frac),
+        test_seed=int(args.test_seed),
+        num_workers=max(0, int(args.num_workers)),
     )
 
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -241,13 +343,20 @@ def main() -> None:
     samples: List[RoofSatSample] = []
     for d in cfg.data_dirs:
         samples.extend(build_dataset_index(d))
-    train_s, val_s = split_train_val(samples, cfg.val_frac, seed=cfg.seed)
+    train_s, val_s, test_s = split_train_val_test(samples, cfg.val_frac, cfg.test_frac, seed=cfg.seed, test_seed=cfg.test_seed)
+    print(json.dumps({"event": "split", "train": len(train_s), "val": len(val_s), "test": len(test_s)}))
+
+    tracker = _MlflowRun(args.mlflow_uri, args.mlflow_experiment, args.run_name)
+    tracker.params({k: v for k, v in asdict(cfg).items() if k not in ("data_dirs", "out_dir")})
+    tracker.params({"n_train": len(train_s), "n_val": len(val_s), "n_test": len(test_s)})
+    tracker.tag("device", torch.cuda.get_device_name(0) if device.type == "cuda" else device.type)
+    tracker.artifact(os.path.join(cfg.out_dir, "config.json"))
 
     train_ds = _RoofSatTorchDataset(train_s, cfg.input_size, aug_kind="train", crop_mode="random", white_roof_p=cfg.white_roof_p)
     val_ds = _RoofSatTorchDataset(val_s, cfg.input_size, aug_kind="none", crop_mode="center", white_roof_p=0.0)
 
-    train_loader = tud.DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = tud.DataLoader(val_ds, batch_size=max(1, cfg.batch_size // 2), shuffle=False, num_workers=2, pin_memory=True)
+    train_loader = tud.DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
+    val_loader = tud.DataLoader(val_ds, batch_size=max(1, cfg.batch_size // 2), shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
 
     model = smp.Unet(
         encoder_name=cfg.encoder,
@@ -344,15 +453,32 @@ def main() -> None:
             "best_epoch": int(best_epoch),
         }
         print(json.dumps(msg))
+        tracker.metrics({"train_loss": train_loss, "val_loss": val_loss, "val_iou": val_iou, "best_iou": best_iou}, step=epoch)
 
         if cfg.target_iou is not None and val_iou >= cfg.target_iou:
             print(json.dumps({"event": "target_reached", "epoch": epoch, "val_iou": round(val_iou, 5), "target": cfg.target_iou}))
+            tracker.tag("stop_event", "target_reached")
             break
 
         if cfg.patience > 0 and epoch - best_epoch >= cfg.patience:
             print(json.dumps({"event": "early_stop", "epoch": epoch, "best_epoch": best_epoch, "best_iou": round(best_iou, 5)}))
+            tracker.tag("stop_event", "early_stop")
             break
+
+    if test_s:
+        _evaluate_test(cfg, test_s, best_path, device, tracker)
+    tracker.end()
+
+
+def _fail_active_mlflow_run() -> None:
+    mlflow = sys.modules.get("mlflow")
+    if mlflow is not None and mlflow.active_run() is not None:
+        mlflow.end_run(status="FAILED")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException:
+        _fail_active_mlflow_run()
+        raise

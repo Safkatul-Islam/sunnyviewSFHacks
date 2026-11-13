@@ -52,7 +52,38 @@ python train.py \
 ```
 
 This writes:
-- `runs/roofsat_unet/best.pt` (PyTorch)
+- `runs/roofsat_unet/best.pt` (PyTorch, the epoch with the best validation IoU)
+- `runs/roofsat_unet/test_metrics.json` and `test_images.txt` (see below)
+
+On Windows, add `--num-workers 0`: DataLoader workers are started with spawn there and cannot pickle the augmentation function.
+
+### Held-out test split
+
+Before the train/val split, `--test-frac` (default `0.15`) holds out a fixed test set chosen from the sorted image paths with `--test-seed` (default `2026`). It stays the same when you change `--seed`, `--val-frac` or any hyperparameter, so runs are comparable. Training and checkpoint selection only see train and val. After training, `best.pt` is scored once on the test set (pixel IoU, mean per-image IoU, Dice, precision, recall) and the result is written to `test_metrics.json`, with the test file names in `test_images.txt`. `--test-frac 0` restores the original train/val-only split.
+
+Choose settings by validation IoU, not test IoU, or the test score stops being a fair estimate.
+
+### Experiment tracking (MLflow)
+
+Tracking is off unless `--mlflow-uri` is set. With it, each run logs its config, split sizes, per-epoch `train_loss`, `val_loss`, `val_iou` and `best_iou`, the final test metrics, and `config.json`, `test_metrics.json` and `test_images.txt` as artifacts. A crash marks the run `FAILED`.
+
+```bash
+python train.py --data-dir ./Roofsat --out-dir ./runs/baseline --mlflow-uri sqlite:///mlflow.db --run-name baseline
+python train.py --data-dir ./Roofsat --out-dir ./runs/no_white_roof --white-roof-p 0 --mlflow-uri sqlite:///mlflow.db --run-name no-white-roof
+python train.py --data-dir ./Roofsat --out-dir ./runs/epochs40 --epochs 40 --mlflow-uri sqlite:///mlflow.db --run-name epochs40
+
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5055   # then open http://127.0.0.1:5055
+```
+
+Results of those three runs on RoofSat (550 images: 398 train, 70 val, 82 test; one seed each; RTX 4070 Laptop GPU, November 2026):
+
+| Run | Best epoch | Val IoU | Test pixel IoU | Test Dice | Test precision / recall | Train time |
+|---|---|---|---|---|---|---|
+| baseline (defaults) | 25 / 25 | 0.918 | 0.933 | 0.965 | 0.966 / 0.964 | 9.8 min |
+| `--white-roof-p 0` | 21 / 25 | 0.918 | 0.934 | 0.966 | 0.971 / 0.960 | 9.8 min |
+| `--epochs 40` | 35 / 40 | 0.928 | 0.940 | 0.969 | 0.973 / 0.965 | 13.9 min |
+
+Training longer helps (picked by val IoU). White-roof augmentation makes no measurable difference on RoofSat, which has few bright commercial roofs; its value would need a test set that has them. Differences of about 0.001 are within run-to-run noise.
 
 ## 4) Export ONNX for the FastAPI segmenter
 
