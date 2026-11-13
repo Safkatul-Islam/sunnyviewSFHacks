@@ -59,8 +59,11 @@ const OVERPASS_USER_AGENT = "sunnyviewSFHacks/1.0 (+https://github.com/bayshores
 
 // Each query gets a bounded budget across endpoints; callers running several queries
 // (locateBuildings) pass a shared `deadline` so the total stays inside the route's budget.
-export const OVERPASS_ATTEMPT_TIMEOUT_MS = 6_000
 export const OVERPASS_QUERY_BUDGET_MS = 9_000
+// Endpoints are raced: the next one starts when the previous fails, or after this delay while it
+// is still pending. Attempts run until the budget ends, so a slow-but-alive server is not cut off.
+// A healthy instance answers in about 1s, so normal queries still send a single request.
+export const OVERPASS_HEDGE_DELAY_MS = 2_000
 // Attempts shorter than this are pointless for Overpass; stop instead of sending them.
 const OVERPASS_MIN_ATTEMPT_MS = 1_000
 // Operators ask clients to wait >= 30s after a 429/406 before retrying the same server.
@@ -167,46 +170,75 @@ async function fetchOverpassQuery(opts: OverpassQueryOpts & { query: string }) {
   if (opts.signal?.aborted) throw new Error("Overpass request aborted")
 
   const deadline = Math.min(Date.now() + OVERPASS_QUERY_BUDGET_MS, opts.deadline ?? Infinity)
-  let lastErr: Error | null = null
+  if (deadline - Date.now() < OVERPASS_MIN_ATTEMPT_MS) throw new Error("Overpass time budget exhausted")
+  const endpoints = overpassEndpoints().filter((endpoint) => !isCoolingDown(endpoint))
+  if (!endpoints.length) throw new Error("Overpass unavailable: all endpoints are cooling down")
 
-  for (const endpoint of overpassEndpoints()) {
-    if (isCoolingDown(endpoint)) continue
-    const remaining = deadline - Date.now()
-    if (remaining < OVERPASS_MIN_ATTEMPT_MS) {
-      lastErr ??= new Error("Overpass time budget exhausted")
-      break
+  const elements = await raceOverpassEndpoints(endpoints, opts.query, deadline, opts.signal)
+  cacheSet(key, { t: Date.now(), elements })
+  return elements
+}
+
+/** Settles with the first successful endpoint; see OVERPASS_HEDGE_DELAY_MS for the start schedule. */
+function raceOverpassEndpoints(
+  endpoints: string[],
+  query: string,
+  deadline: number,
+  signal: AbortSignal | undefined
+): Promise<OverpassElement[]> {
+  return new Promise((resolve, reject) => {
+    const race = new AbortController()
+    let next = 0
+    let pending = 0
+    let settled = false
+    let lastErr: Error | null = null
+    let hedgeTimer: ReturnType<typeof setTimeout> | undefined
+    const budgetTimer = setTimeout(() => finish(lastErr ?? new Error("Overpass time budget exhausted")), deadline - Date.now())
+    const onCallerAbort = () => finish(new Error("Overpass request aborted"))
+    signal?.addEventListener("abort", onCallerAbort, { once: true })
+
+    function finish(outcome: OverpassElement[] | Error) {
+      if (settled) return
+      settled = true
+      clearTimeout(budgetTimer)
+      clearTimeout(hedgeTimer)
+      signal?.removeEventListener("abort", onCallerAbort)
+      race.abort()
+      if (outcome instanceof Error) reject(outcome)
+      else resolve(outcome)
     }
 
-    const ac = new AbortController()
-    const t = setTimeout(() => ac.abort(), Math.min(OVERPASS_ATTEMPT_TIMEOUT_MS, remaining))
-    const onAbort = () => ac.abort()
-    opts.signal?.addEventListener("abort", onAbort, { once: true })
-
-    let result: AttemptResult
-    try {
-      result = await attemptOverpass(endpoint, opts.query, ac.signal)
-    } catch (e) {
-      if (opts.signal?.aborted) throw new Error("Overpass request aborted")
-      // Per-attempt timeout (possibly cut short by the budget) or network error: try the next
-      // endpoint without a cooldown, so a slow burst cannot take every endpoint out of rotation.
-      const error = e instanceof Error ? e : new Error("Overpass request failed")
-      result = { ok: false, error, retry: true, cooldownMs: 0 }
-    } finally {
-      clearTimeout(t)
-      opts.signal?.removeEventListener("abort", onAbort)
+    function launchNext() {
+      clearTimeout(hedgeTimer)
+      if (settled) return
+      if (next >= endpoints.length || deadline - Date.now() < OVERPASS_MIN_ATTEMPT_MS) {
+        // Nothing left to start: fail now if no attempt is still running.
+        if (pending === 0) finish(lastErr ?? new Error("Overpass time budget exhausted"))
+        return
+      }
+      const endpoint = endpoints[next++]
+      pending += 1
+      hedgeTimer = setTimeout(launchNext, OVERPASS_HEDGE_DELAY_MS)
+      attemptOverpass(endpoint, query, race.signal)
+        .catch((e: unknown): AttemptResult => {
+          // Timeout or network error: no cooldown, so a slow burst cannot take every endpoint out of rotation.
+          const error = e instanceof Error ? e : new Error("Overpass request failed")
+          return { ok: false, error, retry: true, cooldownMs: 0 }
+        })
+        .then((result) => {
+          pending -= 1
+          if (settled) return
+          if (result.ok) return finish(result.elements)
+          // Bad query (non-retryable 4xx): another endpoint will not help.
+          if (!result.retry) return finish(result.error)
+          lastErr = result.error
+          markCooldown(endpoint, result.cooldownMs)
+          launchNext()
+        })
     }
 
-    if (result.ok) {
-      cacheSet(key, { t: Date.now(), elements: result.elements })
-      return result.elements
-    }
-    // Bad query (non-retryable 4xx): another endpoint will not help.
-    if (!result.retry) throw result.error
-    lastErr = result.error
-    markCooldown(endpoint, result.cooldownMs)
-  }
-
-  throw lastErr ?? new Error("Overpass unavailable: all endpoints are cooling down")
+    launchNext()
+  })
 }
 
 export type BuildingCandidate = {

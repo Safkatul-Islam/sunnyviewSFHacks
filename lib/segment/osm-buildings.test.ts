@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { staticMapTransformFromCenter } from "@/lib/segment/mercator"
 import {
   fetchOverpassBuildings,
-  OVERPASS_ATTEMPT_TIMEOUT_MS,
   OVERPASS_COOLDOWN_MS,
+  OVERPASS_HEDGE_DELAY_MS,
   OVERPASS_QUERY_BUDGET_MS,
   OVERPASS_SHORT_COOLDOWN_MS,
   pickTopOrCandidates,
@@ -162,6 +162,12 @@ describe("Overpass fetching", () => {
   const calledUrls = () => fetchMock.mock.calls.map((c) => String(c[0]))
   const query = (lat = 37.4) => fetchOverpassBuildings({ lat, lng: -122.1, radiusM: 60 })
 
+  function hangUntilAborted(_url: string, init: RequestInit) {
+    return new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+    })
+  }
+
   beforeEach(() => {
     delete process.env.OVERPASS_URL
     delete g.__sunnyviewOverpassCache
@@ -228,17 +234,61 @@ describe("Overpass fetching", () => {
     expect(calledUrls()).toEqual([MAIN, COFFEE])
   })
 
-  it("aborts a hanging attempt after the per-attempt timeout and tries the next endpoint", async () => {
+  it("starts the next endpoint after the hedge delay while a slow one is still pending", async () => {
     vi.useFakeTimers()
+    const signals: AbortSignal[] = []
     fetchMock.mockImplementation((url: string, init: RequestInit) => {
+      signals.push(init.signal as AbortSignal)
       if (url !== MAIN) return Promise.resolve(ok())
       return new Promise((_resolve, reject) => {
         init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
       })
     })
     const p = query()
-    await vi.advanceTimersByTimeAsync(OVERPASS_ATTEMPT_TIMEOUT_MS + 10)
+    await vi.advanceTimersByTimeAsync(OVERPASS_HEDGE_DELAY_MS - 10)
+    expect(calledUrls()).toEqual([MAIN])
+    await vi.advanceTimersByTimeAsync(20)
     expect(await p).toHaveLength(1)
+    expect(calledUrls()).toEqual([MAIN, COFFEE])
+    // The losing attempt is cancelled once another endpoint answers.
+    expect(signals[0]?.aborted).toBe(true)
+  })
+
+  it("does not hedge when the first endpoint answers within the hedge delay", async () => {
+    vi.useFakeTimers()
+    fetchMock.mockImplementation(
+      () => new Promise<Response>((resolve) => setTimeout(() => resolve(ok()), OVERPASS_HEDGE_DELAY_MS - 200))
+    )
+    const p = query()
+    await vi.advanceTimersByTimeAsync(OVERPASS_QUERY_BUDGET_MS)
+    expect(await p).toHaveLength(1)
+    expect(calledUrls()).toEqual([MAIN])
+  })
+
+  it("lets a slow endpoint keep running for the whole budget instead of cutting it off early", async () => {
+    vi.useFakeTimers()
+    const answerAt = OVERPASS_QUERY_BUDGET_MS - 1_500
+    fetchMock.mockImplementation((url: string, init: RequestInit) => {
+      if (url === MAIN) return new Promise<Response>((resolve) => setTimeout(() => resolve(ok()), answerAt))
+      return hangUntilAborted(url, init)
+    })
+    const p = query()
+    await vi.advanceTimersByTimeAsync(answerAt + 10)
+    expect(await p).toHaveLength(1)
+    expect(calledUrls()).toEqual([MAIN, COFFEE, MAILRU])
+  })
+
+  it("stops the race on a non-retryable 4xx even while another endpoint is pending", async () => {
+    vi.useFakeTimers()
+    fetchMock.mockImplementation((url: string, init: RequestInit) => {
+      if (url === COFFEE) return Promise.resolve(json({}, 400))
+      return hangUntilAborted(url, init)
+    })
+    const p = query().catch((e: Error) => e)
+    await vi.advanceTimersByTimeAsync(OVERPASS_HEDGE_DELAY_MS + 10)
+    const err = await p
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toMatch(/Overpass failed \(400\)/)
     expect(calledUrls()).toEqual([MAIN, COFFEE])
   })
 
@@ -290,12 +340,6 @@ describe("Overpass fetching", () => {
     expect(calledUrls().at(-1)).toBe(MAIN)
   })
 
-  function hangUntilAborted(_url: string, init: RequestInit) {
-    return new Promise<Response>((_resolve, reject) => {
-      init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
-    })
-  }
-
   it("applies the operator-requested 30s cooldown after a 406", async () => {
     vi.useFakeTimers()
     fetchMock.mockResolvedValueOnce(new Response("Not Acceptable", { status: 406 })).mockResolvedValue(ok())
@@ -333,8 +377,8 @@ describe("Overpass fetching", () => {
     const first = query(37.1).catch((e: Error) => e)
     await vi.advanceTimersByTimeAsync(OVERPASS_QUERY_BUDGET_MS + 10)
     expect(await first).toBeInstanceOf(Error)
-    // main timed out after a full attempt, private.coffee was cut short by the query budget
-    expect(calledUrls()).toEqual([MAIN, COFFEE])
+    // every endpoint was raced and ran until the query budget ran out
+    expect(calledUrls()).toEqual([MAIN, COFFEE, MAILRU])
 
     fetchMock.mockReset()
     fetchMock.mockResolvedValue(ok())
