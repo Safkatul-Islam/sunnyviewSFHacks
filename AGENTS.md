@@ -173,10 +173,10 @@ Live features (server side):
 
 Optional:
 - `PVWATTS_BASE_URL`: full PVWatts JSON endpoint URL (default `https://developer.nlr.gov/api/pvwatts/v8.json`).
-- `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`: Redis cache for estimates and shared rate-limit counters (both required; `KV_REST_API_URL` / `KV_REST_API_TOKEN` are accepted too).
+- `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`: Redis cache for estimates, OSM building footprints (`sv:osm:`, 30 days) and shared rate-limit counters (both required; `KV_REST_API_URL` / `KV_REST_API_TOKEN` are accepted too).
 - `SEGMENT_SERVICE_URL`: Python segmenter base URL. Outside production, the route probes `127.0.0.1:8000` and `localhost:8000`.
 - `SEGMENT_IMAGE_FETCH_ALLOWLIST`: comma-separated hostnames `/api/segment` may fetch images from. Private hosts are always blocked.
-- `OVERPASS_URL`: comma-separated Overpass `/api/interpreter` URLs tried before the public instances for `/api/segment` building footprints (for example a self-hosted or keyed instance). Server-only; may contain an API key.
+- `OVERPASS_URL`: comma-separated Overpass `/api/interpreter` URLs for `/api/segment` building footprints, started before the public instances (for example a self-hosted or keyed instance). Endpoints are raced: the next one starts when one fails or after 2s without an answer. Server-only; may contain an API key.
 - `SEGMENT_SHARED_SECRET`: sent as `x-segment-secret` to the Python segmenter when set (server-only).
 - `APP_ORIGIN`: public app origin used to resolve same-origin `imageUrl` paths in `/api/segment` (default `https://$VERCEL_URL`, else `http://127.0.0.1:$PORT`). The request Host is never trusted.
 - `TRUSTED_PROXY_HEADER`: header holding the client IP for rate limiting (`x-vercel-forwarded-for` default on Vercel; otherwise unset means one shared bucket).

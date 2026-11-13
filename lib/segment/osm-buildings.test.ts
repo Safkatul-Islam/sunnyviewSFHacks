@@ -3,6 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { staticMapTransformFromCenter } from "@/lib/segment/mercator"
 import {
   fetchOverpassBuildings,
+  OVERPASS_REDIS_MAX_BYTES,
+  OVERPASS_REDIS_TIMEOUT_MS,
+  OVERPASS_REDIS_TTL_SEC,
   OVERPASS_COOLDOWN_MS,
   OVERPASS_HEDGE_DELAY_MS,
   OVERPASS_QUERY_BUDGET_MS,
@@ -10,6 +13,9 @@ import {
   pickTopOrCandidates,
   rankBuildingCandidates,
 } from "@/lib/segment/osm-buildings"
+
+const redisMock = vi.hoisted(() => ({ getRedis: vi.fn() }))
+vi.mock("@/lib/redis", () => redisMock)
 
 function squareGeom(lat0: number, lon0: number, d: number) {
   return [
@@ -174,6 +180,7 @@ describe("Overpass fetching", () => {
     delete g.__sunnyviewOverpassCooldown
     fetchMock = vi.fn()
     vi.stubGlobal("fetch", fetchMock)
+    redisMock.getRedis.mockReset().mockResolvedValue(null)
   })
 
   afterEach(() => {
@@ -410,5 +417,102 @@ describe("Overpass fetching", () => {
     ac.abort()
     await expect(fetchOverpassBuildings({ lat: 37, lng: -122, radiusM: 60, signal: ac.signal })).rejects.toThrow()
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("Overpass Redis cache", () => {
+  const g = globalThis as any
+  let fetchMock: ReturnType<typeof vi.fn>
+  let redis: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn> }
+  const way = (id: number) => ({ type: "way", id })
+  const respond = (elements: unknown[]) =>
+    new Response(JSON.stringify({ elements }), { status: 200, headers: { "content-type": "application/json" } })
+  const query = (lat = 37.4) => fetchOverpassBuildings({ lat, lng: -122.1, radiusM: 60 })
+
+  beforeEach(() => {
+    delete g.__sunnyviewOverpassCache
+    delete g.__sunnyviewOverpassCooldown
+    fetchMock = vi.fn()
+    vi.stubGlobal("fetch", fetchMock)
+    redis = { get: vi.fn().mockResolvedValue(null), set: vi.fn().mockResolvedValue("OK") }
+    redisMock.getRedis.mockReset().mockResolvedValue(redis)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it("serves a query from Redis without calling Overpass, then from memory", async () => {
+    redis.get.mockResolvedValue([way(9)])
+    expect(await query()).toEqual([way(9)])
+    expect(await query()).toEqual([way(9)])
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(redis.get).toHaveBeenCalledTimes(1)
+    expect(redis.set).not.toHaveBeenCalled()
+  })
+
+  it("stores successful results in Redis for 30 days under a hashed sv:osm: key", async () => {
+    fetchMock.mockResolvedValue(respond([way(7)]))
+    expect(await query()).toEqual([way(7)])
+    expect(OVERPASS_REDIS_TTL_SEC).toBe(30 * 24 * 60 * 60)
+    expect(redis.set).toHaveBeenCalledTimes(1)
+    const [key, value, opts] = redis.set.mock.calls[0]
+    expect(key).toMatch(/^sv:osm:[0-9a-f]{64}$/)
+    expect(value).toEqual([way(7)])
+    expect(opts).toEqual({ ex: OVERPASS_REDIS_TTL_SEC })
+    expect(redis.get).toHaveBeenCalledWith(key)
+  })
+
+  it("uses different keys for different queries", async () => {
+    fetchMock.mockImplementation(async () => respond([way(7)]))
+    await query(37.1)
+    await query(37.2)
+    const keys = redis.set.mock.calls.map((c) => c[0])
+    expect(new Set(keys).size).toBe(2)
+  })
+
+  it("falls back to Overpass when Redis reads and writes fail", async () => {
+    redis.get.mockRejectedValue(new Error("redis down"))
+    redis.set.mockRejectedValue(new Error("redis down"))
+    fetchMock.mockResolvedValue(respond([way(7)]))
+    expect(await query()).toEqual([way(7)])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not wait on a slow Redis for longer than its timeout", async () => {
+    vi.useFakeTimers()
+    redis.get.mockImplementation(() => new Promise(() => {}))
+    redis.set.mockImplementation(() => new Promise(() => {}))
+    fetchMock.mockResolvedValue(respond([way(7)]))
+    const p = query()
+    await vi.advanceTimersByTimeAsync(OVERPASS_REDIS_TIMEOUT_MS - 50)
+    expect(fetchMock).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(OVERPASS_REDIS_TIMEOUT_MS + 100)
+    expect(await p).toEqual([way(7)])
+    expect(OVERPASS_REDIS_TIMEOUT_MS).toBeLessThanOrEqual(500)
+  })
+
+  it("ignores malformed Redis values", async () => {
+    redis.get.mockResolvedValue({ not: "an array" })
+    fetchMock.mockResolvedValue(respond([way(7)]))
+    expect(await query()).toEqual([way(7)])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not store empty or oversized results", async () => {
+    fetchMock.mockResolvedValueOnce(respond([]))
+    expect(await query(37.1)).toEqual([])
+    const huge = [{ type: "way", id: 1, tags: { note: "x".repeat(OVERPASS_REDIS_MAX_BYTES) } }]
+    fetchMock.mockResolvedValueOnce(respond(huge))
+    expect(await query(37.2)).toHaveLength(1)
+    expect(redis.set).not.toHaveBeenCalled()
+  })
+
+  it("skips Redis entirely when it is not configured", async () => {
+    redisMock.getRedis.mockResolvedValue(null)
+    fetchMock.mockResolvedValue(respond([way(7)]))
+    expect(await query()).toEqual([way(7)])
+    expect(redis.get).not.toHaveBeenCalled()
   })
 })

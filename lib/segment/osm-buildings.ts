@@ -1,4 +1,7 @@
+import { createHash } from "node:crypto"
+
 import { toFiniteNumber } from "@/lib/geo/math"
+import { getRedis } from "@/lib/redis"
 import { parseAddressHints, scoreAddrMatch, type AddressHints } from "@/lib/segment/address"
 import {
   mercatorProject,
@@ -44,6 +47,48 @@ function cacheSet(key: string, entry: CacheEntry) {
     if (oldest === undefined) break
     mem.delete(oldest)
   }
+}
+
+// Shared cache across serverless instances (Upstash Redis, when configured). Buildings rarely
+// change, so successful footprint queries are kept for 30 days. Redis is best-effort: slow or
+// failing calls are skipped so they never block or break a lookup.
+export const OVERPASS_REDIS_TTL_SEC = 30 * 24 * 60 * 60
+export const OVERPASS_REDIS_TIMEOUT_MS = 500
+export const OVERPASS_REDIS_MAX_BYTES = 512 * 1024
+const OVERPASS_REDIS_PREFIX = "sv:osm:"
+
+function redisKeyForQuery(query: string) {
+  return OVERPASS_REDIS_PREFIX + createHash("sha256").update(query).digest("hex")
+}
+
+async function withRedisTimeout<T>(run: () => Promise<T>): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), OVERPASS_REDIS_TIMEOUT_MS)
+  })
+  const pending = run()
+  pending.catch(() => {}) // a late failure after the timeout must not become an unhandled rejection
+  try {
+    return await Promise.race([pending, timeout])
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function redisGetElements(query: string): Promise<OverpassElement[] | null> {
+  const redis = await getRedis()
+  if (!redis) return null
+  const value = await withRedisTimeout(() => redis.get<unknown>(redisKeyForQuery(query)))
+  return Array.isArray(value) ? (value as OverpassElement[]) : null
+}
+
+async function redisSetElements(query: string, elements: OverpassElement[]): Promise<void> {
+  if (!elements.length || JSON.stringify(elements).length > OVERPASS_REDIS_MAX_BYTES) return
+  const redis = await getRedis()
+  if (!redis) return
+  await withRedisTimeout(() => redis.set(redisKeyForQuery(query), elements, { ex: OVERPASS_REDIS_TTL_SEC }))
 }
 
 // Public instances, most reliable first (see wiki.openstreetmap.org/wiki/Overpass_API).
@@ -169,6 +214,12 @@ async function fetchOverpassQuery(opts: OverpassQueryOpts & { query: string }) {
   if (hit && Date.now() - hit.t < MEM_TTL_MS) return hit.elements
   if (opts.signal?.aborted) throw new Error("Overpass request aborted")
 
+  const shared = await redisGetElements(opts.query)
+  if (shared) {
+    cacheSet(key, { t: Date.now(), elements: shared })
+    return shared
+  }
+
   const deadline = Math.min(Date.now() + OVERPASS_QUERY_BUDGET_MS, opts.deadline ?? Infinity)
   if (deadline - Date.now() < OVERPASS_MIN_ATTEMPT_MS) throw new Error("Overpass time budget exhausted")
   const endpoints = overpassEndpoints().filter((endpoint) => !isCoolingDown(endpoint))
@@ -176,6 +227,7 @@ async function fetchOverpassQuery(opts: OverpassQueryOpts & { query: string }) {
 
   const elements = await raceOverpassEndpoints(endpoints, opts.query, deadline, opts.signal)
   cacheSet(key, { t: Date.now(), elements })
+  await redisSetElements(opts.query, elements)
   return elements
 }
 
